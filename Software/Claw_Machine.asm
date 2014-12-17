@@ -74,7 +74,46 @@
 ;				Added Variables:
 ;				 ADRSpdx, ADRSpdy, ADRSpdz, ADRMode, ADRTimz, TempEE, TempEED, TimeZ
 ;				Removed Variables:
-;				 TimerCountL, TimerCountH	
+;				 TimerCountL, TimerCountH
+;	V1.07		Added Pop Mode.  This is used to pick up cans and lower the cans down and releasing
+;				 them gently, instead of opening claw at the top of the stroke.
+;				 The system will have to be out of test mode, active in claw AND pop mode.
+;				 Will use Claw mode general operation, but will affect the toy drop routine.
+;				 Added into user menu options
+;					pop
+;				 Added into EEPROM exits save/retreive on startup
+;				 Added into main program flow
+;				Added Variables:
+;				 ClawStat2, SerialTimer 
+;				Added Constants:
+;				 SerialButton, SerialForward, SerialBack, SerialLeft,
+;				 SerialRight, PopMode
+;	V1.08		Added quick controls via RS232 port.  
+;				 This will allow the claw machine to be controlled via quick commands
+;				 sent from computer.  Control forward, back, left, right, and button 
+;				 push.
+;				I = Forward (0x49)
+;				K = Backward (0x4B)
+;				L = Right (0x4C)
+;				J = Left (0x4A)
+;				<spacbar> = Push button (0x20)
+;				When the serial port receives in direction controls, it will set the SerialTimerX or SerialTimerY
+;				 with a preset time down value of x amount of steps.  Each time the command is received,
+;				 the count down timer will reset.  
+;				When the serial port receives in the push button <spacebar>, then the debounce
+;				 bit will be hijacked to force a claw drop.  This will only work for claw machine
+;				 mode.
+;				Added into user menu options
+;				 srtmrx
+;				 srtmry
+;				Added into EEPROM exits save/retreive on startup
+;				Added Constants:
+;				 ADRSTmrX, ADRSTmrY
+;				Removed Variables:
+;				 SerialTimer
+;				Added Variables:
+;				 SerialTimerX, SerialTimerY, SerialTimerXSet
+;				 SerialTimerYSet
 ;
 ;	Crystal: 20 Mhz
 ;
@@ -149,7 +188,8 @@ CBLOCK 0x20
 StatTemp, PCLTemp, WTemp, Temp, SpeedX, SpeedY
 TimerX, TimerY, ClawStat, SpeedClaw, TimerClaw, Delay2, lowDbnc, hiDbnc
 Inner, Outer, RXBuf0, RXBuf1, RXBuf2, RXBuf3, RXBuf4, RXBuf5, RXBuf6, RXBuf7, RXBufPointer
-RXStatus, RXTempBuf, TempSpeed, TempEE, TempEED, TimeZ
+RXStatus, RXTempBuf, TempSpeed, TempEE, TempEED, TimeZ, ClawStat2, SerialTimerX, SerialTimerY
+SerialTimerXSet, SerialTimerYSet
 ENDC
 
 ;***************************************************
@@ -159,6 +199,8 @@ ADRSpdy	equ	1
 ADRSpdz	equ	2
 ADRMode	equ	3
 ADRTimz	equ	4
+ADRSTmrX equ 5
+ADRSTmrY equ 6
 
 ;***************************************************
 ;	Define outputs (can redefine pins if needed here)
@@ -189,6 +231,12 @@ ADRTimz	equ	4
 #define TestMode		ClawStat,7
 #define EnterDetected	RXStatus,0
 #define	EscapeDetected	RXStatus,1
+#define SerialButton	ClawStat2,0
+#define SerialForward	ClawStat2,1
+#define SerialBack		ClawStat2,2
+#define SerialLeft		ClawStat2,3
+#define SerialRight		ClawStat2,4
+#define PopMode			ClawStat2,5
 
 ;***************************************************
 ;Controls:
@@ -209,6 +257,13 @@ ADRTimz	equ	4
 ;									5 = Button pushed debounce pass
 ;									6 = Claw Machine is in Program Mode
 ;									7 = Claw Machine is in Test Mode
+;	ClawStat2					Adds another place to save claw stat data
+;									0 = Spacebar pushed via 232 port
+;									1 = Forward pushed via 232 port
+;									2 = Back pushed via 232 port
+;									3 = Left pushed via 232 port
+;									4 = Right pushed via 232 port
+;									5 = Claw Machine is in Pop Can Mode
 ;	TimerClaw					HOlds step timer count for claw axis
 ;	SpeedTimer					Holds speed of axis for corresponding axis					
 ;	Inner, Outer, Delay2		Used for main program timing
@@ -233,10 +288,22 @@ ADRTimz	equ	4
 ;	ADRMode						EEPROM location to save either modes:
 ;									'0' = Claw Mode
 ;									'1' = Test Mode
+;									'2' = Pop Mode
 ;	ADRTimz						EEPROM location to save time to lower claw
 ;	TempEE						EEPROM data pointer
 ;	TempEED						EEPROM data pulled
 ;	TimeZ						Time to drop claw in claw mode
+;	SerialTimerX, SerialTimerY	Timers to keep track of 232 movement commands.  If
+;								 timer countsdown before next command is received
+;								 then stop movement.  Used on SerialForward, SerialBack,
+;								 SerialLeft, and SerialRight.  Spacebar will need
+;								 this for test mode but not for claw mode.
+;	ADRSTmrX, ADRSTmrY			EEPROM locations to store the timer value used for 
+;								 serial control.  These will fill in the values
+;								 for SerialTimerX and SerialTimerY
+;	SerialTimerXSet, SerialTimerYSet
+;								Retains setpoint that was pulled out of the EEPROM on
+;								 startup and after changing it via the menu.
 ;***************************************************
 
 Reset_Vector	code 0x0000
@@ -262,6 +329,8 @@ Start
 ;	clrf	TimerCountH
 	clrf	ClawStat		;ButtonPush, RaiseClaw, LowerClaw
 							;Home, EnAxis, and ButtonDbnc
+							; are set to "0"
+	clrf	ClawStat2		;232 port commands and Pop Can Mode
 							; are set to "0"
 
 ;Setup Inputs
@@ -370,6 +439,8 @@ Start
 	clrf	TimerX			
 	clrf	TimerY
 	clrf	TimerClaw
+	clrf	SerialTimerX
+	clrf	SerialTimerY
 
 ;Restore saved values from EEPROM
 	movlw	ADRSpdx
@@ -392,6 +463,16 @@ Start
 	call	ReadEEPROM
 	movwf	TimeZ
 
+	movlw	ADRSTmrX
+	movwf	TempEE
+	call	ReadEEPROM	
+	movwf	SerialTimerXSet
+
+	movlw	ADRSTmrY
+	movwf	TempEE
+	call	ReadEEPROM	
+	movwf	SerialTimerYSet
+
 	movlw	ADRMode
 	movwf	TempEE
 	call	ReadEEPROM
@@ -399,10 +480,17 @@ Start
 	btfsc	TempEE,0
 	goto	lblSetRunTestMode
 	bcf		TestMode
+	btfsc	TempEE,2
+	goto	lblSetRunPopMode
+	bcf		PopMode
 	goto	lblContinueSetup
 
 lblSetRunTestMode
 	bsf		TestMode
+	goto	lblContinueSetup
+
+lblSetRunPopMode
+	bsf		PopMode
 
 ;Set speed for motor (pre eeprom programming)
 
@@ -441,7 +529,13 @@ Main
 							; control of claw machine
 	goto	Main
 
-	btfss	TestMode		;Test if claw machine is in test mode
+	btfsc	TestMode		;Test if claw machine is in test mode
+	goto	lblTestMode		;Goto Test Mode operation
+
+;Use for future use if a grid is decided to be used.
+;	btfsc	PopMode			;Test if claw machine is in Pop Mode
+;	goto	lblPopMode		;Goto Pop Mode (currently not addressed)
+
 	goto	lblClawOp		;Goto claw machine game stages
 
 ;****************************************
@@ -495,15 +589,19 @@ lblTestMove
 ;	Structured for sequential flow into 
 ;	 menu structure
 ;	PROG
-;		TEST
-;		CLAW
 ;		SPDX,SPDY,SPDZ
 ;			ENTER:
-;		TIMZ (not implemented yet)
-;		EXITS
+;		CLAW
+;		TEST
+;		POP
+;		TIMZ
+;			ENTER:
+;		SRTMRX, SRTMRY
+;			ENTER:
 ;		EXIT
+;		EXITS
 ;	Algorithm checks that the correct
-;	 values are in the corrct buffer
+;	 values are in the correct buffer location
 ;	 and that the buffer pointer is correct
 ;	Once the enter button is pushed Receive
 ;	 buffer is locked out and no more
@@ -511,10 +609,10 @@ lblTestMove
 ;	 until EnterMode bit is cleared
 ;****************************************
 lblEnterDetected
-;Detect if command "PROG" is detected
+;Detect if command "prog" is detected
 ;	ASCII	p = 70
 ;			r = 72
-;			o = 64
+;			o = 6F
 ;			g = 67
 	movlw	0x70
 	subwf	RXBuf0,W
@@ -546,6 +644,8 @@ lblEnterDetected
 	call	subWaitDisplay
 	bcf		EnterDetected	;Program command has been processed, reset enter
 
+;Once the claw machine detects it is in programming mode, maintain control
+; in the menu structure.
 lblEnterMenu1
 	btfss	EnterDetected	;Check if there is a command to process
 	goto	lblEnterMenu1
@@ -662,7 +762,7 @@ lblSpdZDetect
 	movlw	0x7A
 	subwf	RXBuf3,W
 	btfss	STATUS,Z
-	goto	lblSpdYDetect
+	goto	lblClawDetect
 
 	call	subReturn
 	call	subEnterDisplay
@@ -709,6 +809,9 @@ lblSpdConfigured
 ;			l = 6C
 ;			a = 61
 ;			w = 77	
+;Affects:
+;	TestMode
+;	PopMode
 lblClawDetect
 	movlw	0x63
 	subwf	RXBuf0,W
@@ -732,6 +835,7 @@ lblClawDetect
 	goto	lblTestDetect
 
 	bcf		TestMode
+	bcf		PopMode
 	call	subReturn
 	call	subDoneDisplay
 	call	subReturn
@@ -743,29 +847,66 @@ lblClawDetect
 ;			e = 65
 ;			s = 73
 ;			t = 74	
+;Affects:
+;	TestMode
+;	PopMode
 lblTestDetect
 	movlw	0x74
 	subwf	RXBuf0,W
 	btfss	STATUS,Z
-	goto	lblTimzDetect
+	goto	lblPopDetect
 	movlw	0x65
 	subwf	RXBuf1,W
 	btfss	STATUS,Z
-	goto	lblTimzDetect
+	goto	lblPopDetect
 	movlw	0x73
 	subwf	RXBuf2,W
 	btfss	STATUS,Z
-	goto	lblTimzDetect
+	goto	lblPopDetect
 	movlw	0x74
 	subwf	RXBuf3,W
 	btfss	STATUS,Z
-	goto	lblTimzDetect
+	goto	lblPopDetect
 	movlw	0x04			;Check if pointer is at correct location
+	subwf	RXBufPointer,W
+	btfss	STATUS,Z
+	goto	lblPopDetect
+
+	bsf		TestMode
+	bcf		PopMode
+	call	subReturn
+	call	subDoneDisplay
+	call	subReturn
+	call	subWaitDisplay
+	goto	lblMenu1Reset
+
+;Detect if command "pop" is detected
+;	ASCII	p = 70
+;			o = 6F
+;			p = 70
+;Affects:
+;	TestMode
+;	PopMode	
+lblPopDetect
+	movlw	0x70
+	subwf	RXBuf0,W
+	btfss	STATUS,Z
+	goto	lblTimzDetect
+	movlw	0x6F
+	subwf	RXBuf1,W
+	btfss	STATUS,Z
+	goto	lblTimzDetect
+	movlw	0x70
+	subwf	RXBuf2,W
+	btfss	STATUS,Z
+	goto	lblTimzDetect
+	movlw	0x03			;Check if pointer is at correct location
 	subwf	RXBufPointer,W
 	btfss	STATUS,Z
 	goto	lblTimzDetect
 
-	bsf		TestMode
+	bsf		PopMode
+	bcf		TestMode
 	call	subReturn
 	call	subDoneDisplay
 	call	subReturn
@@ -781,23 +922,23 @@ lblTimzDetect
 	movlw	0x74
 	subwf	RXBuf0,W
 	btfss	STATUS,Z
-	goto	lblExitDetect
+	goto	lblSerialSpeedDetect
 	movlw	0x69
 	subwf	RXBuf1,W
 	btfss	STATUS,Z
-	goto	lblExitDetect
+	goto	lblSerialSpeedDetect
 	movlw	0x6D
 	subwf	RXBuf2,W
 	btfss	STATUS,Z
-	goto	lblExitDetect
+	goto	lblSerialSpeedDetect
 	movlw	0x7A
 	subwf	RXBuf3,W
 	btfss	STATUS,Z
-	goto	lblExitDetect
+	goto	lblSerialSpeedDetect
 	movlw	0x04			;Check if pointer is at correct location
 	subwf	RXBufPointer,W
 	btfss	STATUS,Z
-	goto	lblExitDetect
+	goto	lblSerialSpeedDetect
 
 	call	subReturn
 	call	subEnterDisplay
@@ -833,6 +974,130 @@ lblResetTIMZMenu
 	goto	lblEnterMenuTimz
 
 lblTimzConfigured
+	call	subReturn
+	call	subDoneDisplay
+	call	subReturn
+	call	subWaitDisplay
+	goto	lblMenu1Reset
+
+;Detect if command "srtmrx", "srtmry" is detected
+;	ASCII	s = 73
+;			r = 72
+;			t = 74
+;			m = 6D
+;			r = 72
+;			x = 78
+;			y = 79
+lblSerialSpeedDetect
+	movlw	0x73
+	subwf	RXBuf0,W
+	btfss	STATUS,Z
+	goto	lblExitDetect
+	movlw	0x72
+	subwf	RXBuf1,W
+	btfss	STATUS,Z
+	goto	lblExitDetect
+	movlw	0x74
+	subwf	RXBuf2,W
+	btfss	STATUS,Z
+	goto	lblExitDetect
+	movlw	0x6D
+	subwf	RXBuf3,W
+	btfss	STATUS,Z
+	goto	lblExitDetect
+	movlw	0x72
+	subwf	RXBuf4,W
+	btfss	STATUS,Z
+	goto	lblExitDetect
+
+	movlw	0x06			;Check if pointer is at correct location
+	subwf	RXBufPointer,W
+	btfss	STATUS,Z
+	goto	lblExitDetect
+
+;**************X Axis*************************
+
+lblSerialTimerXDetect
+	movlw	0x78
+	subwf	RXBuf5,W
+	btfss	STATUS,Z
+	goto	lblSerialTimerYDetect
+
+	call	subReturn
+	call	subEnterDisplay
+	call	subClearBuffer
+	bcf		EnterDetected
+
+lblEnterSerialTimerMenuX
+;Sub Menu
+	btfss	EnterDetected	;Check if the user has entered a value
+	goto	lblEnterSerialTimerMenuX
+
+	movlw	0x03			;Make sure only 3 bytes are present
+	subwf	RXBufPointer,W
+	btfss	STATUS,Z
+	goto	lblFailSerialTimerXMenu
+
+	call	subExtractRXBufValue
+	movf	TempSpeed,W
+	btfsc	STATUS,Z		;Check if speed is zero, if it is, then fail entry
+	goto	lblFailSerialTimerXMenu
+	movwf	SerialTimerXSet	;Move entered value into speedX
+	goto	lblSerialTimerConfigured
+
+lblFailSerialTimerXMenu
+	call	subReturn
+	call	subFailDisplay
+	call	subReturn
+	call	subEnterDisplay
+
+lblResetSerialTimerXMenu
+	call	subClearBuffer
+	bcf		EnterDetected
+	goto	lblEnterSerialTimerMenuX
+
+;**************Y Axis*************************
+
+lblSerialTimerYDetect
+	movlw	0x79
+	subwf	RXBuf5,W
+	btfss	STATUS,Z
+	goto	lblExitDetect
+
+	call	subReturn
+	call	subEnterDisplay
+	call	subClearBuffer
+	bcf		EnterDetected
+
+lblEnterSerialTimerMenuY
+;Sub Menu
+	btfss	EnterDetected	;Check if the user has entered a value
+	goto	lblEnterSerialTimerMenuY
+
+	movlw	0x03			;Make sure only 3 bytes are present
+	subwf	RXBufPointer,W
+	btfss	STATUS,Z
+	goto	lblFailSerialTimerYMenu
+
+	call	subExtractRXBufValue
+	movf	TempSpeed,W
+	btfsc	STATUS,Z		;Check if speed is zero, if it is, then fail entry
+	goto	lblFailSerialTimerYMenu
+	movwf	SerialTimerYSet	;Move entered value into speedY
+	goto	lblSerialTimerConfigured
+
+lblFailSerialTimerYMenu
+	call	subReturn
+	call	subFailDisplay
+	call	subReturn
+	call	subEnterDisplay
+
+lblResetSerialTimerYMenu
+	call	subClearBuffer
+	bcf		EnterDetected
+	goto	lblEnterSerialTimerMenuY
+
+lblSerialTimerConfigured
 	call	subReturn
 	call	subDoneDisplay
 	call	subReturn
@@ -901,15 +1166,33 @@ lblExitSDetect
 	movwf	TempEED
 	call	WriteEEPROM
 
+	movlw	ADRSTmrX
+	movwf	TempEE
+	movf	SerialTimerXSet, W
+	movwf	TempEED
+	call	WriteEEPROM
+
+	movlw	ADRSTmrY
+	movwf	TempEE
+	movf	SerialTimerYSet, W
+	movwf	TempEED
+	call	WriteEEPROM
+
 	movlw	ADRMode
 	movwf	TempEE
 	btfsc	TestMode
 	goto	lblSetTestModeEEPROM
+	btfsc	PopMode
+	goto	lblSetPopModeEEPROM
 	movlw	0x00
 	goto	lblSaveModeEEPROM
 
 lblSetTestModeEEPROM
 	movlw	0x01
+	goto	lblSaveModeEEPROM
+
+lblSetPopModeEEPROM
+	movlw	0x04
 
 lblSaveModeEEPROM
 	movwf	TempEED
@@ -1012,16 +1295,75 @@ lblHomeClaw
 ;****************************************
 	movlw	B'00000001'		;clear all of ClawStat except ButtonPush
 	movwf	ClawStat
+	btfsc	PopMode			;Test if in PopMode
+	goto	lblStageFivePopMode
 	bcf		Claw_Close		;open claw
 	movlw	B'01111111'
 	call	Delay2Sec
 	movlw	B'01111111'
 	call	Delay2Sec
+	goto	lblResetStage
 
 ;****************************************
-;	Stage 6:  Reset claw routine
+;	Stage 5/Pop Mode:  Lower claw down
+;	 then open claw. Retract claw.
 ;****************************************
+;Lower Claw
+lblStageFivePopMode
+	movlw	B'01111111'		;Delay for claw to stop oscillating
+	call	Delay2Sec
+	movlw	B'01111111'
+	call	Delay2Sec
 
+	movlw	B'00000101'		;Enable LowerClaw and keep ButtonPush active
+	movwf	ClawStat
+	
+;TimeZ will be multiplied by 5 for timing of the claw drop
+
+	movf	TimeZ,W
+	call	Delay2Sec
+	movf	TimeZ,W
+	call	Delay2Sec
+	movf	TimeZ,W
+	call	Delay2Sec
+	movf	TimeZ,W
+	call	Delay2Sec
+	movf	TimeZ,W
+	call	Delay2Sec
+	
+;****************************************
+;	Stage 6/Pop Mode:  Open Claw for 
+;		predetermined amount of time
+;****************************************
+	movlw	B'00000001'		;clear all of ClawStat and keep ButtonPush active
+	movwf	ClawStat
+	bcf		Claw_Close		;Open the claw
+
+	movlw	B'01111111'
+	call	Delay2Sec
+	movlw	B'01111111'
+	call	Delay2Sec
+
+;****************************************
+;	Stage 7/Pop Mode:  Raise Claw until claw limit
+;				switch is depressed
+;****************************************
+	movlw	B'00000011'		;Enable RaiseClaw and keep ButtonPush active
+	movwf	ClawStat	
+
+lblPopRaise
+	btfsc	ClawUpLim
+	goto	lblPopRaise
+
+	movlw	B'01111111'		;Delay for short period of time
+	call	Delay2Sec
+	movlw	B'01111111'
+	call	Delay2Sec
+
+;****************************************
+;	Reset Stage:  Reset claw routine
+;****************************************
+lblResetStage
 ;at end of claw home routine, then re-enable port b interrupt
 	movlw	B'00010000'		;Enable Joystick control 'EnAxis' and zero out to beginning state
 	movwf	ClawStat
@@ -1663,7 +2005,7 @@ lblSpdExit
 ;	Interrupt Subroutine
 ;	  
 ;****************************************
-org 0x0400
+org 0x0500
 IntService
 	MOVWF	WTemp			;Copy W to TEMP register
 	SWAPF	STATUS,W		;Swap status to be saved into W
@@ -1689,6 +2031,12 @@ IntService
 ;		 and act on it after an enter press
 ;		This will only WRITE TO the RXBuf, it will not 
 ;		 erase the data.
+;		Added quick command control from 232 port: 
+;				I = Forward (0x49)
+;				K = Backward (0x4B)
+;				L = Right (0x4C)
+;				J = Left (0x4A)
+;				<spacbar> = Push button (0x20)
 ;
 ;	Possible issues:
 ;		If there is multiple bytes in the RXREG (2)
@@ -1708,6 +2056,80 @@ ReceiveChk
 	movf	RCREG,W			;Save value read in to temporary variable
 	movwf	RXTempBuf
 
+;Check if the value is to quick control the machine:
+; Commands recognized:
+;	I = Forward (0x49)
+;	K = Backward (0x4B)
+;	L = Right (0x4C)
+;	J = Left (0x4A)
+;	<spacebar> = Push button (0x20)
+; When a command is recognized, then fill a serial timer that will count
+;	down to zero.  If it is above zero, allow for the machine to move
+;	If it zeroes then reset the bit that will be used for controlling the machine
+	movlw	0x49			;ASCII value for I
+	subwf	RXTempBuf,W
+	btfss	STATUS,Z
+	goto	lblSerialBackCheck
+
+	movf	SerialTimerYSet,W	;Sets the amount of steps the Y axis will go 
+	movwf	SerialTimerY	; before movement stops.
+	bsf		SerialForward
+	bcf		SerialBack
+	goto	lblCheckProgramMode
+
+lblSerialBackCheck
+	movlw	0x4B			;ASCII value for K
+	subwf	RXTempBuf,W
+	btfss	STATUS,Z
+	goto	lblSerialLeftCheck
+
+	movf	SerialTimerYSet,W	;Sets the amount of steps the Y axis will go 
+	movwf	SerialTimerY	; before movement stops.
+	bsf		SerialBack
+	bcf		SerialForward
+	goto	lblCheckProgramMode
+
+lblSerialLeftCheck
+	movlw	0x4A			;ASCII value for J
+	subwf	RXTempBuf,W
+	btfss	STATUS,Z
+	goto	lblSerialRightCheck
+
+	movf	SerialTimerXSet,W	;Sets the amount of steps the X axis will go 
+	movwf	SerialTimerX	; before movement stops.
+	bsf		SerialLeft
+	bcf		SerialRight
+	goto	lblCheckProgramMode
+
+lblSerialRightCheck
+	movlw	0x4C			;ASCII value for L
+	subwf	RXTempBuf,W
+	btfss	STATUS,Z
+	goto	lblSerialButtonCheck
+
+	movf	SerialTimerXSet,W	;Sets the amount of steps the X axis will go 
+	movwf	SerialTimerX	; before movement stops.
+	bsf		SerialRight
+	bcf		SerialLeft
+	goto	lblCheckProgramMode
+
+lblSerialButtonCheck
+	movlw	0x20
+	subwf	RXTempBuf,W
+	btfss	STATUS,Z
+	goto	lblEnterCheck
+
+	btfsc	ButtonPush		;Avoid causing a second button push, if already detected
+	goto	lblCheckProgramMode
+
+	bsf		SerialButton	;may need to create OR and AND function to set at once.
+	bcf		SerialForward
+	bcf		SerialBack
+	bcf		SerialRight
+	bcf		SerialLeft
+	goto	lblCheckProgramMode
+
+lblEnterCheck
 ;Check if the value read in is either CR or LF.  If it is not, save value to
 ;	buffer.  If it is, then let Main Program know that enter was pushed.
 	movlw	0x0A			;ASCII value for LF
@@ -1744,6 +2166,9 @@ ReceiveChk
 	btfsc	STATUS,Z
 	goto	lblCheckErrors
 
+;Fill up receive buffer with data input into serial port.
+; Will increment up through the 8 buffers, filling data that
+; comes in.
 ;Check which buffer location to place data.
 	movf	RXBufPointer,W	;Check if the buffer pointer is empty
 	btfss	STATUS,Z
@@ -1938,6 +2363,9 @@ lblClrWDT
 ;****************************************
 
 lblDbncRout
+	btfsc	SerialButton
+	goto	lblSerialButtonPushedInterrupt
+
 ;Debounce routine will use 1 mS timer to check button push until there is no more bounce
 	btfss	ButtonDbnc
 	goto	lblStep
@@ -1963,7 +2391,15 @@ lblDbncLow
 	movf	hiDbnc,1		;Check if all zero
 	btfss	STATUS,Z
 	goto	lblStep
-	
+	goto	lblButtonPushDetected
+
+lblSerialButtonPushedInterrupt	
+;claw drop button press has been detected, start debounce check.	
+	bcf		INTCON,4		;Disable PortB,0 interrupt
+	bcf		INTCON,1		;Clear RB0 Interrupt Flag
+	bcf		SerialButton	;Reset Serial button push detection
+
+lblButtonPushDetected
 	;All zeros (3.174 mS of no bouncing (20 MHz crystal)).  Set ButtonPush bit and reset debounce
 	bsf		ButtonPush
 	bcf		ButtonDbnc
@@ -1998,7 +2434,7 @@ lblStep
 ;	pulse.  Timer2 is setup for .1984 mS timing pulses
 	bcf		XMotStp
 	bcf		YMotStp
-	bcf		ClawStep	                                                                                                                                                                       
+	bcf		ClawStep                                                                                                                                        
 
 ;**********************************************************
 ;	Claw Raise/Lower routine
@@ -2089,7 +2525,12 @@ lblYHome
 ;**********************************************************
 ;	Joystick full control routines
 ;		If user has not pushed the claw down button, 
-;		then use these routines to allow for full control
+;		 then use these routines to allow for full control
+;		The serial port can also be used to control the
+;		 X and Y axis of the claw machine.  It will
+;		 force movement as long as the appropriate serial
+;		 control bit is used and SerialTimerX or
+;		 SerialTimerY has not counted down to zero
 ;	Variables used:
 ;		EnAxis
 ;	Control Inputs used:
@@ -2097,30 +2538,55 @@ lblYHome
 ;		XControlPlus
 ;		YControlMin
 ;		YControlPlus
+;	Serial Control Inputs used:
+;		SerialForward
+;		SerialBack
+;		SerialLeft
+;		SerialRight
 ;**********************************************************
 
 lblXConMin
 	btfss	EnAxis			;Check if joystick can be used for control
 	goto	IntExit
 
+	btfsc	SerialLeft
+	goto	lblXConMinActive
 	btfsc	XControlMin
 	goto	lblXConPlus
+
+lblXConMinActive
 	bcf		XMotDir			;Change motor directions
 	btfss	XLimMinus		;Check if unit is up against limit
 	goto	lblYConMin		;Up against limit and joystick is in minus location
+							;May allow serial timer to be retained until it counts down
 
 	incf	TimerX			;Increment timer for speed of pulses
 	movf	TimerX,0		;Move timer value into WREG
 	subwf	SpeedX,0		;Compare to speed that is set in homing sequence
 	btfss	STATUS,2
 	goto	lblYConMin		;jump to y axis
+
+;If the SerialTimerX has timed down, then stop movement initiated by serial
+	movf	SerialTimerX,W	;Check if SerialTimerX is zero
+	btfsc	STATUS,Z
+	goto	lblXConMinStep	;jump to stepping axis
+
+	decfsz	SerialTimerX
+	goto	lblXConMinStep
+	bcf		SerialLeft
+
+lblXConMinStep
 	clrf	TimerX			;Clear Timer
 	bsf		XMotStp			;Send pulse to driver
 	goto	lblYConMin
 
 lblXConPlus
+	btfsc	SerialRight
+	goto	lblXConPlusActive
 	btfsc	XControlPlus
 	goto	lblYConMin
+
+lblXConPlusActive
 	bsf		XMotDir			;Change motor directions
 	btfss	XLimPlus		;Check if unit is up against limit
 	goto	lblYConMin		;Up against limit and joystick is in plus location
@@ -2130,13 +2596,27 @@ lblXConPlus
 	subwf	SpeedX,0		;Compare to speed that is set in homing sequence
 	btfss	STATUS,2
 	goto	lblYConMin		;jump to y axis
+
+;If the SerialTimerX has timed down, then stop movement initiated by serial
+	movf	SerialTimerX,W	;Check if SerialTimerX is zero
+	btfsc	STATUS,Z
+	goto	lblXConPlusStep	;jump to stepping axis
+
+	decfsz	SerialTimerX
+	goto	lblXConPlusStep
+	bcf		SerialRight
+
+lblXConPlusStep
 	clrf	TimerX			;Clear Timer
 	bsf		XMotStp			;Send pulse to driver
-	goto	lblYConMin
 
 lblYConMin
+	btfsc	SerialBack
+	goto	lblYConMinActive
 	btfsc	YControlMin
 	goto	lblYConPlus
+
+lblYConMinActive
 	bcf		YMotDir			;Change motor directions
 	btfss	YLimMinus		;Check if unit is up against limit
 	goto	IntExit			;Up against limit and joystick is in plus location
@@ -2146,13 +2626,28 @@ lblYConMin
 	subwf	SpeedY,0		;Compare to speed that is set in homing sequence
 	btfss	STATUS,2
 	goto	IntExit			;jump to interrupt exit
+
+;If the SerialTimerY has timed down, then stop movement initiated by serial
+	movf	SerialTimerY,W	;Check if SerialTimerY is zero
+	btfsc	STATUS,Z
+	goto	lblYConMinStep	;jump to stepping axis
+
+	decfsz	SerialTimerY
+	goto	lblYConMinStep
+	bcf		SerialBack
+
+lblYConMinStep
 	clrf	TimerY			;Clear Timer
 	bsf		YMotStp			;Send pulse to driver
 	goto	IntExit
 
 lblYConPlus
+	btfsc	SerialForward
+	goto	lblYConPlusActive
 	btfsc	YControlPlus
 	goto	IntExit
+
+lblYConPlusActive
 	bsf		YMotDir			;Change motor directions
 	btfss	YLimPlus		;Check if unit is up against limit
 	goto	IntExit			;Up against limit and joystick is in plus location
@@ -2162,6 +2657,17 @@ lblYConPlus
 	subwf	SpeedY,0		;Compare to speed that is set in homing sequence
 	btfss	STATUS,2
 	goto	IntExit			;jump to interrupt exit
+
+;If the SerialTimerY has timed down, then stop movement initiated by serial
+	movf	SerialTimerY,W	;Check if SerialTimerX is zero
+	btfsc	STATUS,Z
+	goto	lblYConPlusStep	;jump to stepping axis
+
+	decfsz	SerialTimerY
+	goto	lblYConPlusStep
+	bcf		SerialForward
+
+lblYConPlusStep
 	clrf	TimerY			;Clear Timer
 	bsf		YMotStp			;Send pulse to driver
 	goto	IntExit
